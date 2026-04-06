@@ -13,6 +13,10 @@ use {
     solana_sdk_ids::sysvar,
     solana_slot_hashes::SlotHashes,
     solana_stake_interface::stake_history::StakeHistory,
+    solana_sbpf::{
+        memory_region::MemoryRegion,
+        ebpf::MM_STATIC_SYSVAR_START,
+    },
     solana_svm_type_overrides::sync::Arc,
     solana_sysvar::SysvarSerialize,
     solana_sysvar_id::SysvarId,
@@ -27,7 +31,7 @@ impl ::solana_frozen_abi::abi_example::AbiExample for SysvarCache {
     }
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Debug)]
 pub struct SysvarCache {
     // full account data as provided by bank, including any trailing zero bytes
     clock: Option<Vec<u8>>,
@@ -49,6 +53,108 @@ pub struct SysvarCache {
     fees: Option<Fees>,
     #[expect(deprecated)]
     recent_blockhashes: Option<RecentBlockhashes>,
+
+    // Pre-created memory regions for static sysvars (populated once per slot)
+    static_sysvar_regions: Vec<MemoryRegion>,
+}
+
+impl Clone for SysvarCache {
+    fn clone(&self) -> Self {
+        let mut new_cache = Self {
+            clock: self.clock.clone(),
+            epoch_schedule: self.epoch_schedule.clone(),
+            epoch_rewards: self.epoch_rewards.clone(),
+            rent: self.rent.clone(),
+            slot_hashes: self.slot_hashes.clone(),
+            stake_history: self.stake_history.clone(),
+            last_restart_slot: self.last_restart_slot.clone(),
+            slot_hashes_obj: self.slot_hashes_obj.clone(),
+            stake_history_obj: self.stake_history_obj.clone(),
+            fees: self.fees.clone(),
+            recent_blockhashes: self.recent_blockhashes.clone(),
+            static_sysvar_regions: Vec::new(),
+        };
+        // Repopulate regions with pointers to the new cache's data
+        new_cache.populate_static_sysvar_regions();
+        new_cache
+    }
+}
+
+impl SysvarCache {
+    /// Populates the static sysvar memory regions with pointers to the current
+    /// sysvar data buffers. Called once per slot when sysvar data changes.
+    fn populate_static_sysvar_regions(&mut self) {
+        self.static_sysvar_regions.clear();
+        let sysvars: [(&[u8], &Option<Vec<u8>>); 7] = [
+            (b"SOL_CLOCK_SYSVAR", &self.clock),
+            (b"SOL_RENT_SYSVAR", &self.rent),
+            (b"SOL_EPOCH_SCHEDULE_SYSVAR", &self.epoch_schedule),
+            (b"SOL_EPOCH_REWARDS_SYSVAR", &self.epoch_rewards),
+            (b"SOL_SLOT_HASHES_SYSVAR", &self.slot_hashes),
+            (b"SOL_STAKE_HISTORY_SYSVAR", &self.stake_history),
+            (b"SOL_LAST_RESTART_SLOT_SYSVAR", &self.last_restart_slot),
+        ];
+        for (name, bytes_opt) in sysvars {
+            if let Some(bytes) = bytes_opt {
+                self.static_sysvar_regions.push(
+                    MemoryRegion::new_readonly(bytes.as_slice(), sysvar_address(name))
+                );
+            }
+        }
+    }
+
+    /// Returns the pre-created static sysvar memory regions.
+    /// These are populated once per slot for optimal performance.
+    pub fn get_static_sysvar_regions(&self) -> &[MemoryRegion] {
+        &self.static_sysvar_regions
+    }
+}
+
+#[inline(always)]
+const fn murmur3_32(buf: &[u8]) -> u32 {
+    let mut hash = 0;
+    let mut i = 0;
+    while i < buf.len() / 4 {
+        let buf = [buf[i * 4], buf[i * 4 + 1], buf[i * 4 + 2], buf[i * 4 + 3]];
+        hash ^= pre_mix(buf);
+        hash = hash.rotate_left(13);
+        hash = hash.wrapping_mul(5).wrapping_add(0xe6546b64);
+
+        i += 1;
+    }
+    match buf.len() % 4 {
+        0 => {}
+        1 => {
+            hash ^= pre_mix([buf[i * 4], 0, 0, 0]);
+        }
+        2 => {
+            hash ^= pre_mix([buf[i * 4], buf[i * 4 + 1], 0, 0]);
+        }
+        3 => {
+            hash ^= pre_mix([buf[i * 4], buf[i * 4 + 1], buf[i * 4 + 2], 0]);
+        }
+        _ => { /* unreachable!() */ }
+    }
+
+    hash ^= buf.len() as u32;
+    hash ^= hash.wrapping_shr(16);
+    hash = hash.wrapping_mul(0x85ebca6b);
+    hash ^= hash.wrapping_shr(13);
+    hash = hash.wrapping_mul(0xc2b2ae35);
+    hash ^= hash.wrapping_shr(16);
+
+    hash
+}
+
+const fn pre_mix(buf: [u8; 4]) -> u32 {
+    u32::from_le_bytes(buf)
+        .wrapping_mul(0xcc9e2d51)
+        .rotate_left(15)
+        .wrapping_mul(0x1b873593)
+}
+
+const fn sysvar_address(buf: &[u8]) -> u64 {
+    murmur3_32(buf) as u64 & 0xffffffff | MM_STATIC_SYSVAR_START 
 }
 
 // declare_deprecated_sysvar_id doesn't support const.
@@ -270,6 +376,9 @@ impl SysvarCache {
                 }
             });
         }
+
+        // Populate static sysvar memory regions once per slot
+        self.populate_static_sysvar_regions();
     }
 
     pub fn reset(&mut self) {

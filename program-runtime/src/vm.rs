@@ -56,11 +56,17 @@ pub fn create_vm<'a, 'b>(
 ) -> Result<EbpfVm<'a, InvokeContext<'b, 'b>>, Box<dyn std::error::Error>> {
     let stack_size = stack.len();
     let heap_size = heap.len();
+    let static_sysvar_regions = if invoke_context.get_feature_set().static_sysvars {
+        invoke_context.get_sysvar_cache().get_static_sysvar_regions()
+    } else {
+        &[]
+    };
     let memory_mapping = create_memory_mapping(
         program,
         stack,
         heap,
         regions,
+        static_sysvar_regions,
         invoke_context.transaction_context,
         invoke_context
             .get_feature_set()
@@ -85,13 +91,14 @@ fn create_memory_mapping<'a, C: ContextObject>(
     stack: &'a mut [u8],
     heap: &'a mut [u8],
     additional_regions: Vec<MemoryRegion>,
+    static_sysvar_regions: &[MemoryRegion],
     transaction_context: &TransactionContext,
     virtual_address_space_adjustments: bool,
     account_data_direct_mapping: bool,
 ) -> Result<MemoryMapping, Box<dyn std::error::Error>> {
     let config = executable.get_config();
     let sbpf_version = executable.get_sbpf_version();
-    let regions: Vec<MemoryRegion> = vec![
+    let mut regions = vec![
         executable.get_ro_region(),
         MemoryRegion::new_writable_gapped(
             stack,
@@ -103,10 +110,10 @@ fn create_memory_mapping<'a, C: ContextObject>(
             },
         ),
         MemoryRegion::new_writable(heap, MM_HEAP_START),
-    ]
-    .into_iter()
-    .chain(additional_regions)
-    .collect();
+    ];
+    // Zero-copy bulk append of pre-cached static sysvar regions
+    regions.extend_from_slice(static_sysvar_regions);
+    regions.extend(additional_regions);
 
     Ok(MemoryMapping::new_with_access_violation_handler(
         regions,
